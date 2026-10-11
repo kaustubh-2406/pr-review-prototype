@@ -137,17 +137,18 @@ describe("PRs from jobs", () => {
     expect(pr.group).toBe("done");
   });
 
-  it("puts a PR in the tabs by who it waits on, and done ones leave Open after a week", () => {
-    const old = toPrView([job({ event: "APPROVED", updated_at: at(8 * 1440) })]);
-    const fresh = toPrView([job({ event: "APPROVED", updated_at: at(60) })]);
-    const author = toPrView([job({ updated_at: at(30 * 1440) })]);
-    expect([
-      inTab(old, "open", NOW),
-      inTab(fresh, "open", NOW),
-      inTab(author, "open", NOW),
-    ]).toEqual([false, true, true]);
+  it("keeps what waits on you or Claude in Open; the rest leaves after 2 quiet days", () => {
+    const open = (j: Partial<Job>) => inTab(toPrView([job(j)]), "open", NOW);
+    expect(open({ event: "APPROVED", updated_at: at(1440) })).toBe(true);
+    expect(open({ event: "APPROVED", updated_at: at(3 * 1440) })).toBe(false);
+    // Waiting on the author: a merged or abandoned PR looks just like this, so it leaves too.
+    expect(open({ event: "COMMENTED", updated_at: at(1440) })).toBe(true);
+    expect(open({ event: "COMMENTED", updated_at: at(12 * 1440) })).toBe(false);
+    expect(open({ status: "held", updated_at: at(30 * 1440) })).toBe(true);
+    expect(open({ status: "queued", updated_at: at(30 * 1440) })).toBe(true);
+    const old = toPrView([job({ event: "APPROVED", updated_at: at(30 * 1440) })]);
     expect(inTab(old, "all", NOW)).toBe(true);
-    expect(inTab(fresh, "needs", NOW)).toBe(false);
+    expect(inTab(old, "needs", NOW)).toBe(false);
   });
 
   it("orders Needs you by the timer that runs out first", () => {

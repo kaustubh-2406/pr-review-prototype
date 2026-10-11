@@ -124,7 +124,7 @@ export function renderListPage(input: ListPageInput): string {
   const tabs = html`<nav class="tabs">${TABS.map(
     (t) =>
       html`<a class="tab${t === tab ? " on" : ""}" href="${t === "needs" ? "/" : `/?tab=${t}`}"${t === tab ? html` aria-current="page"` : ""}>${TAB_LABELS[t]} <span class="count">${inEach[t].length}</span></a>`,
-  )}<span class="tabnote">Done PRs leave Open after ${OPEN_DAYS} days; All keeps them.</span></nav>`;
+  )}<span class="tabnote">PRs not waiting on you or Claude leave Open after ${OPEN_DAYS} quiet days; All keeps them.</span></nav>`;
   const body =
     tab === "needs"
       ? needsRows(shown, input)

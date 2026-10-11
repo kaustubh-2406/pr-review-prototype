@@ -30,8 +30,11 @@ export const TABS = ["needs", "open", "all"] as const;
 export type Tab = (typeof TABS)[number];
 export const TAB_LABELS: Record<Tab, string> = { needs: "Needs you", open: "Open", all: "All" };
 
-/** A PR that is done and quiet this long leaves the Open tab; All still has it. */
-export const OPEN_DAYS = 7;
+/**
+ * A PR that waits on neither you nor Claude leaves the Open tab after this many quiet days; All
+ * still has it. Merged and closed PRs are not tracked, so this is what takes them off the board.
+ */
+export const OPEN_DAYS = 2;
 
 export const droppedIds = (job: Job): string[] => {
   try {
@@ -169,7 +172,11 @@ export function toPrView(jobs: Job[]): PrView {
 export function inTab(pr: PrView, tab: Tab, now: Date): boolean {
   if (tab === "needs") return pr.group === "needs";
   if (tab === "open")
-    return pr.group !== "done" || now.getTime() - Date.parse(pr.updatedAt) < OPEN_DAYS * 86_400_000;
+    return (
+      pr.group === "needs" ||
+      pr.group === "progress" ||
+      now.getTime() - Date.parse(pr.updatedAt) < OPEN_DAYS * 86_400_000
+    );
   return true;
 }
 
