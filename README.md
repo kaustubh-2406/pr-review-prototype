@@ -34,12 +34,17 @@ npm run service -- test-notify  # show a sample desktop notification
 - **Starts by itself.** A Task Scheduler task named "Proxy Reviewer" starts 30 s after you log on, runs as you with no window, and never needs admin rights. It only runs while you are logged on, because it uses your `gh` and Claude logins.
 - **Restarts itself.** A small supervisor restarts the server after a crash (5 s, 15 s, 1 min, then every 5 min). If startup checks fail (for example, no network yet or logged out of `gh`), it retries more slowly and sends one notification with the reason.
 - **One at a time.** A lock file stops a second server. `npm start` while the service runs says "already running".
-- **Notifications.** A Windows notification appears when a review is posted ("Requested changes · owner/repo#12"), when one waits for your OK ("Needs your OK · owner/repo#12", click to open it on the status page), or when a job fails for good. Click the others to open the PR.
+- **Notifications.** A Windows notification appears when a review is posted ("Requested changes · owner/repo#12"), when one waits for your OK ("Needs your OK · owner/repo#12", click to open that PR on the status page), or when a job fails for good. Click the others to open the PR.
 - **Logs.** `logs/proxy-reviewer.<date>.N.log` (server) and `logs/supervisor.<date>.N.log`, rotated daily or at 10 MB, keeping the last 7.
 - **Sleep.** Nothing runs while the PC sleeps. On wake the next poll picks up whatever is waiting.
 
 ## Status page
-Open **http://localhost:4777** while the server runs. It lists recent PRs with their status, findings, cost and a link to the posted review, and refreshes every 5 s. Click a row to read the full review.
+Open **http://localhost:4777** while the server runs. Pages are built on the server and reload every 30 s while you are not clicking. Design and the options it was picked from: issue #8.
+
+- **PR list (`/`), one row per PR, in three tabs.** **Needs you** (the default): what waits on you, soonest timer first, with a live countdown, the author, ticket and total cost; click a row to see its rounds. **Open** (`?tab=open`): a board with a column for each who the PR waits on (you, Claude, the author, done). A PR waiting on the author or done leaves it after 2 quiet days (merged and closed PRs are not tracked); All keeps it. **All** (`?tab=all`): one line per PR, rounds as R1/R2/R3 links.
+- **One PR (`/pr/<owner>/<repo>/<n>`).** Every round on one timeline, newest open (`?round=N` opens another). Each finding shows only what is wrong and what happens if it is not fixed; the fix and the reasoning are for the author and stay on GitHub. Earlier findings show their verdicts, and each finding shows what later rounds said about it. A side panel keeps the buttons and the timer in view.
+- **Next review** (top right) opens the model, effort, style and wait-for-OK pickers.
+- Buttons are plain forms: each carries the per-start token, and the server also checks the Host and Origin headers. The JSON API under `/api/` stays for scripts and tests.
 
 | Button | Shown for | What it does |
 |---|---|---|
@@ -52,7 +57,7 @@ Open **http://localhost:4777** while the server runs. It lists recent PRs with t
 | **Drop / Keep** | each new finding of a review that needs your OK | Leaves the finding out of the post (the author never sees it), or puts it back. Saved at once; the timer uses your choices. |
 | **Pause posting / Resume** | header | While paused, reviews still run and wait unposted. Resume posts them. Survives restarts. |
 
-The header also has **Model**, **Effort** and **Style** pickers for the next review. Style is how findings are written: *New skill + new format* (default), *Caveman + new format* or *Caveman + old format*. A pick applies from the next review on, survives restarts, and a running review keeps what it started with. See [`docs/review-styles.html`](docs/review-styles.html). **Wait for OK** sets how long a review that would request changes waits for you: Off, 15, 30 min, 1 h or 2 h. A review already waiting keeps its time.
+**Next review** in the header holds the **Model**, **Effort** and **Style** pickers. Style is how findings are written: *New skill + new format* (default), *Caveman + new format* or *Caveman + old format*. A pick applies from the next review on, survives restarts, and a running review keeps what it started with. See [`docs/review-styles.html`](docs/review-styles.html). **Wait for OK** sets how long a review that would request changes waits for you: Off, 15, 30 min, 1 h or 2 h. A review already waiting keeps its time.
 
 It listens on 127.0.0.1 only. Buttons need a secret token that is only in the page, and requests for other host names are refused, so other websites open in your browser can't press them. Turn it off or move it with `statusPage.enabled` and `statusPage.port`.
 
@@ -208,7 +213,11 @@ src/supervisor.ts restarts the server with backoff
 src/service.ts    Task Scheduler install / start / stop / status
 src/runtime.ts    live facts for the page (last poll, pause setting)
 src/web/server.ts status page HTTP server and API
-src/web/page.ts   status page HTML
+src/web/html.ts   escaping html`` helper for server-rendered pages
+src/web/prs.ts    jobs grouped into PRs, rounds and tabs
+src/web/layout.ts page shell: header, pickers, styles, the small page script
+src/web/list-page.ts  PR list (Needs you / Open / All)
+src/web/review-page.ts one PR: rounds timeline and side panel
 prompts/review.md review prompt
 prompts/follow-up.md follow-up (round 2+) prompt
 test/             vitest tests

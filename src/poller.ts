@@ -48,6 +48,7 @@ export async function pollOnce(deps: PollDeps): Promise<PollSummary> {
         headSha: pr.headSha,
         title: pr.title,
         url: pr.url,
+        author: pr.author,
         decision,
       });
       const fields = {

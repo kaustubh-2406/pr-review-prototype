@@ -57,6 +57,7 @@ function job(headSha: string): Job {
     hold_until: null,
     released: null,
     dropped: null,
+    author: null,
     reason: null,
     attempts: 0,
     review_id: null,

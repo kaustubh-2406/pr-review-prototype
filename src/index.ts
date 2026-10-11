@@ -152,6 +152,7 @@ try {
       headSha: pr.headSha,
       title: pr.title,
       url: pr.url,
+      author: pr.author,
     });
     const after = await worker.processOne(signal, job.id, { force: true });
     if (!ok(after)) process.exitCode = 1;

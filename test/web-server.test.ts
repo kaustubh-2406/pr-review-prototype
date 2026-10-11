@@ -19,7 +19,14 @@ function call(
     token,
     host,
     body,
-  }: { method?: string; token?: string; host?: string; body?: string } = {},
+    headers = {},
+  }: {
+    method?: string;
+    token?: string;
+    host?: string;
+    body?: string;
+    headers?: Record<string, string>;
+  } = {},
 ): Promise<{ status: number; body: string; headers: Record<string, unknown> }> {
   return new Promise((resolve, reject) => {
     const req = request(
@@ -31,6 +38,7 @@ function call(
         headers: {
           Host: host ?? `127.0.0.1:${port}`,
           ...(token ? { "X-Proxy-Token": token } : {}),
+          ...headers,
         },
       },
       (res) => {
@@ -90,12 +98,108 @@ describe("status server", () => {
     state.close();
   });
 
-  it("serves the page with the token and a strict content policy", async () => {
+  it("serves the page with the token in its forms and a strict content policy", async () => {
     const res = await call(server.port, "/");
     expect(res.status).toBe(200);
-    expect(res.body).toContain(`var TOKEN = "${server.token}";`);
-    expect(String(res.headers["content-security-policy"])).toContain("default-src 'none'");
+    expect(res.body).toContain(`<input type="hidden" name="token" value="${server.token}">`);
+    const policy = String(res.headers["content-security-policy"]);
+    expect(policy).toContain("default-src 'none'");
+    expect(policy).toContain("form-action 'self'");
     expect(res.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+
+  describe("pages and their forms", () => {
+    const origin = () => `http://127.0.0.1:${server.port}`;
+    const form = (
+      path: string,
+      fields: Record<string, string>,
+      headers: Record<string, string> = {},
+    ) =>
+      call(server.port, path, {
+        method: "POST",
+        body: new URLSearchParams(fields).toString(),
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Origin: origin(),
+          ...headers,
+        },
+      });
+
+    it("serves the three tabs and the PR page, and 404s a PR it never saw", async () => {
+      seed(5);
+      for (const tab of ["", "?tab=open", "?tab=all", "?tab=bogus"]) {
+        expect((await call(server.port, `/${tab}`)).status).toBe(200);
+      }
+      const all = await call(server.port, "/?tab=all");
+      expect(all.body).toContain('href="/pr/acme/api/5"');
+      const pr = await call(server.port, "/pr/acme/api/5");
+      expect(pr.status).toBe(200);
+      expect(pr.body).toContain("PR 5");
+      expect((await call(server.port, "/pr/acme/api/6")).status).toBe(404);
+    });
+
+    it("runs an action from a form and goes back to the page it came from", async () => {
+      const res = await form("/do/posting/pause", { token: server.token, back: "/?tab=open" });
+      expect(res.status).toBe(303);
+      expect(res.headers.location).toBe("/?tab=open");
+      expect(isPostingPaused(state)).toBe(true);
+    });
+
+    it("refuses a form without the token or from another site", async () => {
+      expect((await form("/do/posting/pause", { back: "/" })).status).toBe(403);
+      expect((await form("/do/posting/pause", { token: "x".repeat(32), back: "/" })).status).toBe(
+        403,
+      );
+      const evil = await form(
+        "/do/posting/pause",
+        { token: server.token },
+        { Origin: "http://evil.example" },
+      );
+      expect(evil.status).toBe(403);
+      expect(isPostingPaused(state)).toBe(false);
+    });
+
+    it("only goes back to a page on this server", async () => {
+      for (const back of ["//evil.example/x", "https://evil.example", "/\\evil.example", "nope"]) {
+        const res = await form("/do/posting/pause", { token: server.token, back });
+        expect(res.headers.location).toBe("/");
+      }
+    });
+
+    it("shows a failed action's error once, on the page it went back to", async () => {
+      const res = await form("/do/jobs/999/retry", { token: server.token, back: "/?tab=all" });
+      expect(res.status).toBe(303);
+      const location = String(res.headers.location);
+      expect(location).toMatch(/^\/\?tab=all&flash=[0-9a-f]+$/);
+      expect((await call(server.port, location)).body).toContain("No job 999");
+      expect((await call(server.port, location)).body).not.toContain("No job 999");
+      // A made-up flash id shows nothing.
+      expect((await call(server.port, "/?flash=deadbeef")).body).not.toContain('role="alert"');
+    });
+
+    it("saves the pickers from the popover, and refuses anything else", async () => {
+      const ok = await form("/do/settings", {
+        token: server.token,
+        back: "/",
+        model: "claude-sonnet-5-5",
+        effort: "low",
+        style: "caveman-classic",
+        hold: "60",
+      });
+      expect(ok.headers.location).toBe("/");
+      const s = JSON.parse((await call(server.port, "/api/status")).body);
+      expect(s).toMatchObject({
+        model: "claude-sonnet-5-5",
+        effort: "low",
+        style: "caveman-classic",
+        holdMin: 60,
+      });
+      for (const bad of [{ model: "gpt" }, { hold: "7" }]) {
+        const res = await form("/do/settings", { token: server.token, back: "/", ...bad });
+        expect(String(res.headers.location)).toContain("flash=");
+      }
+      expect(holdMinutes(state, parseConfig({}))).toBe(60);
+    });
   });
 
   it("refuses a request for another host name (DNS rebinding)", async () => {
@@ -364,6 +468,36 @@ describe("status server", () => {
       expect(state.get(id)?.dropped).toBeNull();
       state.release(id);
       expect((await post(`/api/jobs/${id}/drop`, { ids: ["F1"] })).status).toBe(409);
+    });
+
+    it("drops and keeps one finding, and posts, from the PR page's forms", async () => {
+      const id = heldJob();
+      const send = (path: string, fields: Record<string, string> = {}) =>
+        call(server.port, path, {
+          method: "POST",
+          body: new URLSearchParams({
+            token: server.token,
+            back: "/pr/acme/api/1",
+            ...fields,
+          }).toString(),
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        });
+      const page = await call(server.port, "/pr/acme/api/1");
+      expect(page.body).toContain(`action="/do/jobs/${id}/drop"`);
+      expect(page.body).toContain("Post 3 findings");
+
+      await send(`/do/jobs/${id}/drop`, { id: "F2", dropped: "1" });
+      await send(`/do/jobs/${id}/drop`, { id: "F3", dropped: "1" });
+      expect(state.get(id)?.dropped).toBe('["F2","F3"]');
+      await send(`/do/jobs/${id}/drop`, { id: "F2", dropped: "0" });
+      expect(state.get(id)?.dropped).toBe('["F3"]');
+      expect((await call(server.port, "/pr/acme/api/1")).body).toContain("Post 2 findings");
+      const bad = await send(`/do/jobs/${id}/drop`, { id: "F9", dropped: "1" });
+      expect(String(bad.headers.location)).toContain("flash=");
+
+      const res = await send(`/do/jobs/${id}/post`);
+      expect(res.headers.location).toBe("/pr/acme/api/1");
+      expect(state.get(id)).toMatchObject({ status: "reviewed", released: "you" });
     });
 
     it("can be re-reviewed", async () => {

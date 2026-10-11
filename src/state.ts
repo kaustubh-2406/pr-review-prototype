@@ -47,6 +47,8 @@ export interface Job {
   released: "you" | "timer" | null;
   /** JSON array of F-ids you dropped while it was held; they are never posted. */
   dropped: string | null;
+  /** The PR's author login. null on jobs saved before it was recorded. */
+  author: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -58,6 +60,8 @@ export interface SeenInput {
   title: string;
   url: string;
   decision: Decision;
+  /** The PR's author login, shown on the status page. */
+  author?: string;
 }
 
 /** new: first time this commit is seen · requeued: was skipped, now eligible · known: no change */
@@ -114,6 +118,8 @@ const MIGRATIONS: string[] = [
      fetched_at TEXT    NOT NULL,
      PRIMARY KEY (repo, pr)
    );`,
+  `ALTER TABLE jobs ADD COLUMN author TEXT;
+   CREATE INDEX jobs_pr ON jobs (repo, pr);`,
 ];
 
 export interface PublishOutcome {
@@ -210,6 +216,8 @@ export interface State extends TicketStore {
   listByStatus(status: JobStatus): Job[];
   /** Most recently updated jobs first. */
   listRecent(limit: number): Job[];
+  /** Every job of one PR, oldest first. */
+  listForPr(repo: string, pr: number): Job[];
   /**
    * Send a job back to `queued` (review again) or `reviewed` (post again) with a fresh
    * attempt budget, but only from one of the given statuses. Returns undefined otherwise.
@@ -232,8 +240,8 @@ export function openState(path: string): State {
   const findJob = db.prepare("SELECT * FROM jobs WHERE repo = ? AND pr = ? AND head_sha = ?");
   const getJob = db.prepare("SELECT * FROM jobs WHERE id = ?");
   const insertJob = db.prepare(
-    `INSERT INTO jobs (repo, pr, head_sha, title, url, status, reason, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO jobs (repo, pr, head_sha, title, url, status, reason, author, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const updateSeen = db.prepare(
     `UPDATE jobs SET status = ?, reason = ?, title = ?, updated_at = ?
@@ -304,6 +312,11 @@ export function openState(path: string): State {
     "UPDATE jobs SET dropped = ?, updated_at = ? WHERE id = ? AND status = 'held'",
   );
   const selectRecent = db.prepare("SELECT * FROM jobs ORDER BY updated_at DESC, id DESC LIMIT ?");
+  const selectForPr = db.prepare("SELECT * FROM jobs WHERE repo = ? AND pr = ? ORDER BY id");
+  // The author never changes, so every job of the PR gets it, older ones included.
+  const setAuthor = db.prepare(
+    "UPDATE jobs SET author = ? WHERE repo = ? AND pr = ? AND author IS NOT ?",
+  );
   const readTicket = db.prepare("SELECT data FROM tickets WHERE repo = ? AND pr = ?");
   const writeTicket = db.prepare(
     `INSERT INTO tickets (repo, pr, data, fetched_at) VALUES (?, ?, ?, ?)
@@ -383,9 +396,10 @@ export function openState(path: string): State {
     url: string;
     status: JobStatus;
     reason: string | null;
+    author: string | undefined;
     now: string;
   }): void {
-    const { repo, pr, headSha, title, url, status, reason, now } = input;
+    const { repo, pr, headSha, title, url, status, reason, author, now } = input;
     const { lastInsertRowid } = insertJob.run(
       repo,
       pr,
@@ -394,6 +408,7 @@ export function openState(path: string): State {
       url,
       status,
       reason,
+      author ?? null,
       now,
       now,
     );
@@ -401,8 +416,9 @@ export function openState(path: string): State {
   }
 
   return {
-    recordSeen({ repo, pr, headSha, title, url, decision }) {
+    recordSeen({ repo, pr, headSha, title, url, decision, author }) {
       const now = iso();
+      if (author) setAuthor.run(author, repo, pr, author);
       const status: JobStatus = decision.action === "queue" ? "queued" : "skipped";
       const reason = decision.action === "skip" ? decision.reason : null;
       const existing = toJob(findJob.get(repo, pr, headSha));
@@ -410,7 +426,7 @@ export function openState(path: string): State {
       if (!existing) {
         // A new push makes any older commit of this PR that is still waiting pointless.
         supersede.run(now, repo, pr, headSha);
-        insertLinked({ repo, pr, headSha, title, url, status, reason, now });
+        insertLinked({ repo, pr, headSha, title, url, status, reason, author, now });
         return "new";
       }
       // A review you stopped stays stopped until you start it again.
@@ -427,12 +443,23 @@ export function openState(path: string): State {
       return "known";
     },
 
-    enqueue({ repo, pr, headSha, title, url }) {
+    enqueue({ repo, pr, headSha, title, url, author }) {
       const now = iso();
+      if (author) setAuthor.run(author, repo, pr, author);
       const existing = toJob(findJob.get(repo, pr, headSha));
       if (!existing) {
         supersede.run(now, repo, pr, headSha);
-        insertLinked({ repo, pr, headSha, title, url, status: "queued", reason: null, now });
+        insertLinked({
+          repo,
+          pr,
+          headSha,
+          title,
+          url,
+          status: "queued",
+          reason: null,
+          author,
+          now,
+        });
       } else if (!["preparing", "reviewing", "posting"].includes(existing.status)) {
         requeueManual.run(title, now, existing.id);
       }
@@ -519,6 +546,10 @@ export function openState(path: string): State {
 
     listRecent(limit) {
       return selectRecent.all(limit) as unknown as Job[];
+    },
+
+    listForPr(repo, pr) {
+      return selectForPr.all(repo, pr) as unknown as Job[];
     },
 
     resetJob(id, to, from) {

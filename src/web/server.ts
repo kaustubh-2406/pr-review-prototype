@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { z } from "zod";
 import { type Config, EFFORTS, HOLD_CHOICES, MODELS, STYLES } from "../config.ts";
 import type { Logger } from "../log.ts";
+import type { ReviewRun } from "../reviewer.ts";
 import {
   currentSessionUsage,
   holdMinutes,
@@ -20,7 +21,10 @@ import {
 import { APPROVED_BY_YOU, type Job, type JobStatus, type State } from "../state.ts";
 import { STYLE_SPECS } from "../styles.ts";
 import type { PostedReview } from "../types.ts";
-import { renderPage } from "./page.ts";
+import type { Chrome } from "./layout.ts";
+import { renderListPage } from "./list-page.ts";
+import { droppedIds, groupByPr, TABS, type Tab, toPrView } from "./prs.ts";
+import { renderReviewPage } from "./review-page.ts";
 
 export interface StatusServerDeps {
   state: State;
@@ -101,6 +105,27 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   }
 }
 
+/** A form post: urlencoded fields. */
+async function readFormBody(req: IncomingMessage): Promise<URLSearchParams> {
+  let text = "";
+  for await (const chunk of req) {
+    text += chunk;
+    if (text.length > 4096) throw new HttpError(413, "Body too large");
+  }
+  return new URLSearchParams(text);
+}
+
+/** Where a form goes back to: a path on this server only, never another site. */
+const safeBack = (back: string | null) => (back && /^\/(?![/\\])[^\s\\]*$/.test(back) ? back : "/");
+
+const sameToken = (a: string | null | undefined, b: string) =>
+  typeof a === "string" && a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
+
+/** A page's content policy: only its own nonce'd style and script, forms only to this server. */
+const pagePolicy = (nonce: string) =>
+  `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; ` +
+  "img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
 async function readSavedReview(job: Job): Promise<unknown> {
   if (!job.output_dir) return null;
   try {
@@ -120,6 +145,16 @@ export async function startStatusServer(deps: StatusServerDeps): Promise<StatusS
   let port = deps.port ?? config.statusPage.port;
 
   const allowedHosts = () => new Set([`localhost:${port}`, `127.0.0.1:${port}`]);
+  const allowedOrigins = () => new Set([...allowedHosts()].map((h) => `http://${h}`));
+  // An action's error, shown once on the page it redirects to. Keyed by a random id so a link
+  // from elsewhere can't put words on the page.
+  const flashes = new Map<string, string>();
+  function flash(message: string): string {
+    const id = randomBytes(8).toString("hex");
+    flashes.set(id, message);
+    if (flashes.size > 50) flashes.delete(flashes.keys().next().value as string);
+    return id;
+  }
 
   function jobOr404(id: string): Job {
     const job = /^\d+$/.test(id) ? state.get(Number(id)) : undefined;
@@ -215,14 +250,131 @@ export async function startStatusServer(deps: StatusServerDeps): Promise<StatusS
     return after;
   }
 
+  function chromeFor(url: URL): Chrome {
+    const { model, effort, style } = reviewSettings(state, config);
+    const flashId = url.searchParams.get("flash");
+    const error = flashId ? (flashes.get(flashId) ?? null) : null;
+    if (flashId) flashes.delete(flashId);
+    const back = new URL(url);
+    back.searchParams.delete("flash");
+    return {
+      token,
+      nonce: randomBytes(16).toString("base64"),
+      back: back.pathname + back.search,
+      error,
+      now: new Date(),
+      viewer: runtime.viewer,
+      lastPollAt: runtime.lastPollAt,
+      lastPollError: runtime.lastPollError,
+      pollIntervalSec: config.pollIntervalSec,
+      postingPaused: isPostingPaused(state),
+      publishMode: config.publish.mode,
+      sessionUsage: currentSessionUsage(state) ?? null,
+      maxSessionUsagePct: config.review.maxSessionUsagePct ?? null,
+      picks: {
+        model,
+        effort,
+        style,
+        holdMin: holdMinutes(state, config),
+        models: MODELS,
+        efforts: EFFORTS,
+        styles: STYLES.map((key) => ({ key, label: STYLE_SPECS[key].label })),
+        holdChoices: holdChoices(config),
+      },
+    };
+  }
+
+  function sendPage(res: ServerResponse, chrome: Chrome, body: string): void {
+    send(res, 200, body, "text/html; charset=utf-8", {
+      "Content-Security-Policy": pagePolicy(chrome.nonce),
+      "X-Frame-Options": "DENY",
+    });
+  }
+
+  /**
+   * A button on a page: a form post with the token in a field. Afterwards the browser goes back
+   * to the page it came from, with the error if the action failed.
+   */
+  async function handleForm(
+    req: IncomingMessage,
+    res: ServerResponse,
+    path: string,
+  ): Promise<void> {
+    // A form from another site sends its own Origin; the token is the second fence.
+    const origin = req.headers.origin;
+    if (origin !== undefined && !allowedOrigins().has(origin))
+      throw new HttpError(403, "Bad origin");
+    const form = await readFormBody(req);
+    if (!sameToken(form.get("token"), token)) throw new HttpError(403, "Missing token");
+    const back = safeBack(form.get("back"));
+    let location = back;
+    try {
+      await formAction(path, form);
+    } catch (err) {
+      if (!(err instanceof HttpError) || err.status >= 500) throw err;
+      const to = new URL(back, "http://x");
+      to.searchParams.set("flash", flash(err.message));
+      location = to.pathname + to.search;
+    }
+    res.writeHead(303, { Location: location, "Cache-Control": "no-store" });
+    res.end();
+  }
+
+  async function formAction(path: string, form: URLSearchParams): Promise<void> {
+    const jobAction = /^\/do\/jobs\/([^/]+)\/([a-z-]+)$/.exec(path);
+    if (jobAction?.[1] && jobAction[2]) {
+      const job = jobOr404(jobAction[1]);
+      if (jobAction[2] === "approve") {
+        await approveJob(job);
+        return;
+      }
+      if (jobAction[2] === "drop") {
+        const id = form.get("id") ?? "";
+        const others = droppedIds(job).filter((d) => d !== id);
+        await dropFindings(job, { ids: form.get("dropped") === "1" ? [...others, id] : others });
+        return;
+      }
+      act(job, jobAction[2]);
+      return;
+    }
+    if (path === "/do/posting/pause" || path === "/do/posting/resume") {
+      const paused = path.endsWith("pause");
+      setPostingPaused(state, paused);
+      log.info({ paused }, paused ? "posting paused" : "posting resumed");
+      if (!paused) worker.kick();
+      return;
+    }
+    if (path === "/do/settings") {
+      const field = (k: string) => form.get(k) || undefined;
+      const parsed = reviewChoiceSchema.safeParse({
+        model: field("model"),
+        effort: field("effort"),
+        style: field("style"),
+      });
+      if (!parsed.success) throw new HttpError(400, z.prettifyError(parsed.error));
+      const hold = form.get("hold");
+      const minutes = hold === null ? null : Number(hold);
+      if (minutes !== null && !holdChoices(config).includes(minutes)) {
+        throw new HttpError(400, `Pick one of ${holdChoices(config).join(", ")} minutes`);
+      }
+      setReviewChoice(state, parsed.data);
+      if (minutes !== null) setHoldMinutes(state, minutes);
+      log.info({ ...parsed.data, holdMin: minutes }, "review settings changed");
+      return;
+    }
+    throw new HttpError(404, "Not found");
+  }
+
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // DNS rebinding: a hostile name that resolves to 127.0.0.1 still sends its own Host.
     if (!allowedHosts().has(req.headers.host ?? "")) throw new HttpError(403, "Bad host");
     const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
     const path = url.pathname;
 
+    if (req.method === "POST" && path.startsWith("/do/")) return handleForm(req, res, path);
     if (req.method === "POST") {
-      if (req.headers["x-proxy-token"] !== token) throw new HttpError(403, "Missing token");
+      if (!sameToken(req.headers["x-proxy-token"] as string | undefined, token))
+        throw new HttpError(403, "Missing token");
       const jobAction = /^\/api\/jobs\/([^/]+)\/([a-z-]+)$/.exec(path);
       if (jobAction?.[1] && jobAction[2] === "approve") {
         return sendJson(res, 200, await approveJob(jobOr404(jobAction[1])));
@@ -264,13 +416,44 @@ export async function startStatusServer(deps: StatusServerDeps): Promise<StatusS
     if (req.method !== "GET") throw new HttpError(405, "Method not allowed");
 
     if (path === "/") {
-      const nonce = randomBytes(16).toString("base64");
-      return send(res, 200, renderPage({ token, nonce }), "text/html; charset=utf-8", {
-        "Content-Security-Policy":
-          `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; ` +
-          "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
-        "X-Frame-Options": "DENY",
-      });
+      const asked = url.searchParams.get("tab");
+      const tab: Tab = TABS.includes(asked as Tab) ? (asked as Tab) : "needs";
+      const chrome = chromeFor(url);
+      const prs = groupByPr(state.listRecent(500));
+      const tickets = new Map<string, string[]>();
+      if (config.ticket.enabled && tab === "needs") {
+        for (const pr of prs) {
+          const ids = state.getTicket(pr.repo, pr.pr)?.tickets.map((t) => t.id) ?? [];
+          if (ids.length) tickets.set(`${pr.repo}#${pr.pr}`, ids);
+        }
+      }
+      return sendPage(res, chrome, renderListPage({ chrome, tab, prs, tickets }));
+    }
+    const prPage = /^\/pr\/([^/]+)\/([^/]+)\/(\d+)$/.exec(path);
+    if (prPage?.[1] && prPage[2] && prPage[3]) {
+      const repo = `${decodeURIComponent(prPage[1])}/${decodeURIComponent(prPage[2])}`;
+      const jobs = state.listForPr(repo, Number(prPage[3]));
+      if (!jobs.length) throw new HttpError(404, "No reviews for that PR");
+      const pr = toPrView(jobs);
+      const runs = new Map<number, ReviewRun | null>();
+      for (const job of pr.rounds)
+        runs.set(job.id, (await readSavedReview(job)) as ReviewRun | null);
+      // ?job=<id> (from a notification) or ?round=<n> opens that round.
+      const byJob = pr.rounds.findIndex((j) => String(j.id) === url.searchParams.get("job"));
+      const round = byJob >= 0 ? byJob + 1 : Number(url.searchParams.get("round")) || null;
+      const chrome = chromeFor(url);
+      return sendPage(
+        res,
+        chrome,
+        renderReviewPage({
+          chrome,
+          pr,
+          runs,
+          ticket: config.ticket.enabled ? (state.getTicket(pr.repo, pr.pr) ?? null) : undefined,
+          openRound: round,
+          canApprove: Boolean(approve),
+        }),
+      );
     }
     if (path === "/api/status") {
       const { model, effort, style } = reviewSettings(state, config);
