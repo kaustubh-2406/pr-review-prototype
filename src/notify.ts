@@ -102,7 +102,9 @@ export function notificationFor(
     return {
       title: `Needs your OK · ${ref}`,
       body: `Would request changes: ${counts} · ${when} — ${event.job.title}`.slice(0, 250),
-      url: statusUrl ? `${statusUrl}/#job-${event.job.id}` : event.job.url,
+      url: statusUrl
+        ? `${statusUrl}/pr/${event.job.repo}/${event.job.pr}?job=${event.job.id}`
+        : event.job.url,
     };
   }
   if (event.type === "posted") {

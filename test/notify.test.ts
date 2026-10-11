@@ -112,7 +112,7 @@ describe("notificationFor", () => {
     );
     expect(held).toMatchObject({
       title: "Needs your OK · acme/api#128",
-      url: "http://localhost:4777/#job-7",
+      url: "http://localhost:4777/pr/acme/api/128?job=7",
     });
     expect(held.body).toMatch(/^Would request changes: 2 bugs · 1 nit · posts at 10:30 — Fix/);
   });
