@@ -49,6 +49,8 @@ export interface Job {
   dropped: string | null;
   /** The PR's author login. null on jobs saved before it was recorded. */
   author: string | null;
+  /** 1 while a queued job waits for a later poll to see the review request again. */
+  awaiting_confirm: number;
   created_at: string;
   updated_at: string;
 }
@@ -62,10 +64,15 @@ export interface SeenInput {
   decision: Decision;
   /** The PR's author login, shown on the status page. */
   author?: string;
+  /** Queue it, but start only once a later poll sees the request again (an accidental assign). */
+  confirm?: boolean;
 }
 
-/** new: first time this commit is seen · requeued: was skipped, now eligible · known: no change */
-export type SeenResult = "new" | "requeued" | "known";
+/**
+ * new: first time this commit is seen · requeued: was skipped, now eligible ·
+ * confirmed: a later poll saw the request again, so it may start · known: no change
+ */
+export type SeenResult = "new" | "requeued" | "confirmed" | "known";
 
 export interface ReviewOutcome {
   findings: number;
@@ -120,6 +127,7 @@ const MIGRATIONS: string[] = [
    );`,
   `ALTER TABLE jobs ADD COLUMN author TEXT;
    CREATE INDEX jobs_pr ON jobs (repo, pr);`,
+  `ALTER TABLE jobs ADD COLUMN awaiting_confirm INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 export interface PublishOutcome {
@@ -153,9 +161,16 @@ export const APPROVED_BY_YOU = "approved by you";
 export const HELD_REASON = "needs your OK";
 /** Skip reason for a held review you discarded. */
 export const DISCARDED_REASON = "discarded by you";
+/** Skip reason for a request gone before a second poll confirmed it. */
+export const UNREQUESTED_REASON = "review request removed";
 
 export interface State extends TicketStore {
   recordSeen(input: SeenInput): SeenResult;
+  /**
+   * Skip every job still waiting for its request to be confirmed whose PR is not in
+   * `requested` (this poll's review requests). Returns the skipped jobs.
+   */
+  dropUnconfirmed(requested: { repo: string; pr: number }[]): Job[];
   /** Queue a PR commit by hand, ignoring skip rules. Resets a finished or failed job. */
   enqueue(input: Omit<SeenInput, "decision">): Job;
   /**
@@ -240,12 +255,23 @@ export function openState(path: string): State {
   const findJob = db.prepare("SELECT * FROM jobs WHERE repo = ? AND pr = ? AND head_sha = ?");
   const getJob = db.prepare("SELECT * FROM jobs WHERE id = ?");
   const insertJob = db.prepare(
-    `INSERT INTO jobs (repo, pr, head_sha, title, url, status, reason, author, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO jobs (repo, pr, head_sha, title, url, status, reason, author, awaiting_confirm,
+       created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const updateSeen = db.prepare(
-    `UPDATE jobs SET status = ?, reason = ?, title = ?, updated_at = ?
+    `UPDATE jobs SET status = ?, reason = ?, title = ?, awaiting_confirm = ?, updated_at = ?
      WHERE repo = ? AND pr = ? AND head_sha = ?`,
+  );
+  const confirmStmt = db.prepare(
+    "UPDATE jobs SET awaiting_confirm = 0, updated_at = ? WHERE id = ?",
+  );
+  const selectUnconfirmed = db.prepare(
+    "SELECT * FROM jobs WHERE status = 'queued' AND awaiting_confirm = 1 ORDER BY id",
+  );
+  const dropStmt = db.prepare(
+    `UPDATE jobs SET status = 'skipped', reason = ?, awaiting_confirm = 0, updated_at = ?
+     WHERE id = ? AND status = 'queued' AND awaiting_confirm = 1`,
   );
   const supersede = db.prepare(
     `UPDATE jobs SET status = 'skipped', reason = 'superseded', updated_at = ?
@@ -254,7 +280,7 @@ export function openState(path: string): State {
   const requeueManual = db.prepare(
     `UPDATE jobs SET status = 'queued', reason = NULL, error = NULL, attempts = 0,
        next_attempt_at = NULL, waiting_since = NULL, hold_until = NULL, released = NULL,
-       dropped = NULL, title = ?, updated_at = ?
+       dropped = NULL, awaiting_confirm = 0, title = ?, updated_at = ?
      WHERE id = ?`,
   );
   // A held review whose timer ran out is posted, and marks itself released by the timer.
@@ -264,7 +290,7 @@ export function openState(path: string): State {
     `UPDATE jobs SET ${nextStep}, started_at = ?, updated_at = ?
      WHERE id = (
        SELECT id FROM jobs
-       WHERE (status IN ('queued', 'reviewed')
+       WHERE (status IN ('queued', 'reviewed') AND awaiting_confirm = 0
            AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
          OR (status = 'held' AND hold_until IS NOT NULL AND hold_until <= ?)
        ORDER BY id LIMIT 1
@@ -276,7 +302,8 @@ export function openState(path: string): State {
     `UPDATE jobs SET status = 'preparing', started_at = ?, updated_at = ?
      WHERE id = (
        SELECT id FROM jobs
-       WHERE status = 'queued' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+       WHERE status = 'queued' AND awaiting_confirm = 0
+         AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
        ORDER BY id LIMIT 1
      )
      RETURNING *`,
@@ -287,7 +314,7 @@ export function openState(path: string): State {
        -- A post retried as reviewed keeps your OK and drops; a new review starts over.
        released = CASE ?1 WHEN 'queued' THEN NULL ELSE released END,
        dropped = CASE ?1 WHEN 'queued' THEN NULL ELSE dropped END,
-       updated_at = ?2
+       awaiting_confirm = 0, updated_at = ?2
      WHERE id = ?3`,
   );
   const holdStmt = db.prepare(
@@ -328,7 +355,7 @@ export function openState(path: string): State {
     "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
   );
   const claimOne = db.prepare(
-    `UPDATE jobs SET ${nextStep}, started_at = ?, updated_at = ?
+    `UPDATE jobs SET ${nextStep}, awaiting_confirm = 0, started_at = ?, updated_at = ?
      WHERE id = ? AND status IN ('queued', 'reviewed')
      RETURNING *`,
   );
@@ -397,9 +424,10 @@ export function openState(path: string): State {
     status: JobStatus;
     reason: string | null;
     author: string | undefined;
+    awaitingConfirm: boolean;
     now: string;
   }): void {
-    const { repo, pr, headSha, title, url, status, reason, author, now } = input;
+    const { repo, pr, headSha, title, url, status, reason, author, awaitingConfirm, now } = input;
     const { lastInsertRowid } = insertJob.run(
       repo,
       pr,
@@ -409,6 +437,7 @@ export function openState(path: string): State {
       status,
       reason,
       author ?? null,
+      awaitingConfirm ? 1 : 0,
       now,
       now,
     );
@@ -416,31 +445,61 @@ export function openState(path: string): State {
   }
 
   return {
-    recordSeen({ repo, pr, headSha, title, url, decision, author }) {
+    recordSeen({ repo, pr, headSha, title, url, decision, author, confirm = false }) {
       const now = iso();
       if (author) setAuthor.run(author, repo, pr, author);
       const status: JobStatus = decision.action === "queue" ? "queued" : "skipped";
       const reason = decision.action === "skip" ? decision.reason : null;
+      const awaitingConfirm = confirm && status === "queued";
       const existing = toJob(findJob.get(repo, pr, headSha));
 
       if (!existing) {
         // A new push makes any older commit of this PR that is still waiting pointless.
         supersede.run(now, repo, pr, headSha);
-        insertLinked({ repo, pr, headSha, title, url, status, reason, author, now });
+        insertLinked({
+          repo,
+          pr,
+          headSha,
+          title,
+          url,
+          status,
+          reason,
+          author,
+          awaitingConfirm,
+          now,
+        });
         return "new";
+      }
+      // Seen again on a later poll: the request was no accident.
+      if (existing.status === "queued" && existing.awaiting_confirm) {
+        confirmStmt.run(now, existing.id);
+        return "confirmed";
       }
       // A review you stopped stays stopped until you start it again.
       if (existing.status !== "skipped" || existing.reason === STOPPED_REASON) return "known";
 
       // Only skipped jobs are re-evaluated: a draft can become ready, config can change.
       if (status === "queued") {
-        updateSeen.run(status, null, title, now, repo, pr, headSha);
+        updateSeen.run(status, null, title, awaitingConfirm ? 1 : 0, now, repo, pr, headSha);
         return "requeued";
       }
       if (reason !== existing.reason) {
-        updateSeen.run(status, reason, title, now, repo, pr, headSha);
+        updateSeen.run(status, reason, title, 0, now, repo, pr, headSha);
       }
       return "known";
+    },
+
+    dropUnconfirmed(requested) {
+      const keep = new Set(requested.map(({ repo, pr }) => `${repo}#${pr}`));
+      const now = iso();
+      const dropped: Job[] = [];
+      for (const job of selectUnconfirmed.all() as unknown as Job[]) {
+        if (keep.has(`${job.repo}#${job.pr}`)) continue;
+        if (dropStmt.run(UNREQUESTED_REASON, now, job.id).changes) {
+          dropped.push(toJob(getJob.get(job.id)) as Job);
+        }
+      }
+      return dropped;
     },
 
     enqueue({ repo, pr, headSha, title, url, author }) {
@@ -458,6 +517,7 @@ export function openState(path: string): State {
           status: "queued",
           reason: null,
           author,
+          awaitingConfirm: false,
           now,
         });
       } else if (!["preparing", "reviewing", "posting"].includes(existing.status)) {

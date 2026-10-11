@@ -81,6 +81,8 @@ export function describeJob(job: Job, { paused }: { paused: boolean }): Look {
     case "queued":
       if (job.next_attempt_at && /^session usage /.test(job.reason ?? ""))
         return look("Usage limit", "pending", job.reason);
+      if (job.awaiting_confirm)
+        return look("Queued", "quiet", "Starts once the next poll confirms");
       return job.next_attempt_at
         ? look("Retrying later", "work", job.error)
         : look("Queued", "quiet");

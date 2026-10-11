@@ -36,6 +36,7 @@ npm run service -- test-notify  # show a sample desktop notification
 - **One at a time.** A lock file stops a second server. `npm start` while the service runs says "already running".
 - **Notifications.** A Windows notification appears when a review is posted ("Requested changes · owner/repo#12"), when one waits for your OK ("Needs your OK · owner/repo#12", click to open that PR on the status page), or when a job fails for good. Click the others to open the PR.
 - **Logs.** `logs/proxy-reviewer.<date>.N.log` (server) and `logs/supervisor.<date>.N.log`, rotated daily or at 10 MB, keeping the last 7.
+- **Accidental assigns.** A new review request is queued but starts only once the next poll (about 60 s later) still finds it. If you were removed in between, the job is skipped as "review request removed" and Claude never runs; **Review now** on its page still starts it. `npm run once` has no second poll, so it starts new requests at once.
 - **Sleep.** Nothing runs while the PC sleeps. On wake the next poll picks up whatever is waiting.
 
 ## Status page

@@ -15,6 +15,8 @@ export interface PollDeps {
   onQueued?: () => void;
   /** Called after every poll in the loop, with its summary or error. */
   onPolled?: (result: PollSummary | Error) => void;
+  /** A new request starts only once the next poll still sees it (default). Off for a one-shot run. */
+  confirmRequests?: boolean;
 }
 
 export interface PollSummary {
@@ -28,7 +30,7 @@ export interface PollSummary {
 const MAX_BACKOFF_MS = 5 * 60_000;
 
 export async function pollOnce(deps: PollDeps): Promise<PollSummary> {
-  const { github, state, config, viewer, log } = deps;
+  const { github, state, config, viewer, log, confirmRequests = true } = deps;
   const requests = await github.searchReviewRequests();
   const summary: PollSummary = {
     found: requests.length,
@@ -50,6 +52,7 @@ export async function pollOnce(deps: PollDeps): Promise<PollSummary> {
         url: pr.url,
         author: pr.author,
         decision,
+        confirm: confirmRequests,
       });
       const fields = {
         repo,
@@ -62,6 +65,9 @@ export async function pollOnce(deps: PollDeps): Promise<PollSummary> {
       if (result === "known") {
         summary.known++;
         log.debug(fields, "already seen");
+      } else if (result === "confirmed") {
+        summary.queued++;
+        log.info(fields, "request confirmed");
       } else if (decision.action === "queue") {
         summary.queued++;
         log.info(fields, result === "requeued" ? "requeued" : "queued");
@@ -74,6 +80,11 @@ export async function pollOnce(deps: PollDeps): Promise<PollSummary> {
       summary.errors++;
       log.error({ err, repo, pr: number }, "failed to process PR");
     }
+  }
+  // Requested, then removed before the next poll saw it again: never reviewed.
+  for (const job of state.dropUnconfirmed(requests.map((r) => ({ repo: r.repo, pr: r.number })))) {
+    summary.skipped++;
+    log.info({ repo: job.repo, pr: job.pr, title: job.title }, "request removed before confirming");
   }
   if (summary.queued > 0) deps.onQueued?.();
   return summary;
