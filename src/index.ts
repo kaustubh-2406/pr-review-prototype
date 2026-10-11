@@ -165,7 +165,8 @@ try {
     const after = await worker.processOne(signal, id, { force: true });
     if (!ok(after)) process.exitCode = 1;
   } else if (args.once) {
-    log.info(await pollOnce(deps), "poll finished");
+    // No second poll is coming, and you asked for this run: review what is requested now.
+    log.info(await pollOnce({ ...deps, confirmRequests: false }), "poll finished");
     if (config.review.enabled) {
       state.recoverStale();
       log.info({ processed: await worker.drain(signal) }, "queue drained");

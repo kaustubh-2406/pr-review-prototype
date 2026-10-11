@@ -40,6 +40,7 @@ function job(over: Partial<Job> = {}): Job {
     released: null,
     dropped: null,
     author: "dev",
+    awaiting_confirm: 0,
     created_at: at(60),
     updated_at: at(60),
     ...over,
