@@ -135,9 +135,9 @@ export function notificationFor(
   };
 }
 
-export type RunScript = (command: string, args: string[]) => Promise<void>;
+export type RunCommand = (command: string, args: string[]) => Promise<void>;
 
-const execRun: RunScript = async (command, args) => {
+const execRun: RunCommand = async (command, args) => {
   await execFileAsync(command, args, { windowsHide: true, timeout: 30_000 });
 };
 
@@ -168,7 +168,7 @@ function commandFor(notification: Notification): { command: string; args: string
 export function createNotifier(
   { enabled }: { enabled: boolean },
   log: Logger,
-  run: RunScript = execRun,
+  run: RunCommand = execRun,
 ): Notifier {
   return {
     async notify(notification) {
