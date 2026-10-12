@@ -70,7 +70,8 @@ function send(res: ServerResponse, status: number, body: string, type: string, e
     "Content-Type": type,
     "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "no-referrer",
+    // Not "no-referrer": under it browsers send `Origin: null` on our own form posts.
+    "Referrer-Policy": "same-origin",
     ...extra,
   });
   res.end(body);
